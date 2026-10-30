@@ -27,13 +27,41 @@ test('model and answer rules retain their original semantics', () => {
   assert.equal(answerConfig.minimumConfidence, .22);
   for (const target of classes) for (const key of classes) {
     const expected = target === key || answerConfig.rules.some(r => r.target === target && r.accept.includes(key));
-    assert.equal(policy.assess(target, {key,confidence:.8}).accepted, expected);
+    // A confidence above every calibrated bar must still respect the compatibility table.
+    assert.equal(policy.assess(target, {key,confidence:1}).accepted, expected);
     assert.equal(policy.assess(target, {key,confidence:.219}).accepted, false);
   }
 });
-test('345 metadata entries produce 189 easy, 50 selected hard, and 106 paused prompts', () => {
+test('each enabled prompt carries a calibrated confidence bar that only accepts very close drawings', () => {
+  const answerConfig = embedded('embeddedAnswerRules'), policy = Answers.create(classes, answerConfig);
+  const enabled = config.questions.filter(q => q.enabled !== false);
+  assert.equal(Object.keys(answerConfig.promptConfidence).length, enabled.length);
+  for (const question of enabled) {
+    const bar = answerConfig.promptConfidence[question.key];
+    assert.ok(bar >= answerConfig.minimumConfidence && bar <= 1, question.key);
+    assert.equal(policy.thresholdFor(question.key), bar);
+    // Just below the prompt's own bar must fail even for the exact class.
+    assert.equal(policy.assess(question.key, {key: question.key, confidence: bar - 1e-4}).accepted, false, question.key);
+    assert.equal(policy.assess(question.key, {key: question.key, confidence: bar}).accepted, true, question.key);
+  }
+  // The old flat 22% bar must no longer pass a typical prompt.
+  const median = Object.values(answerConfig.promptConfidence).sort((a,b)=>a-b)[Math.floor(enabled.length/2)];
+  assert.ok(median > .9, 'median bar should demand a close match, got ' + median);
+  for (const key of ['square','circle','line'])
+    assert.equal(config.questions.find(q=>q.key===key).enabled, false, key + ' is unrecognisable and must stay paused');
+});
+test('prompt bars below the floor or above one are rejected', () => {
+  const answerConfig = embedded('embeddedAnswerRules');
+  for (const bad of [.21, 1.01, 0, -1]) {
+    const broken = {...answerConfig, promptConfidence: {...answerConfig.promptConfidence, apple: bad}};
+    assert.throws(() => Answers.create(classes, broken), /Invalid prompt threshold/);
+  }
+  const unknown = {...answerConfig, promptConfidence: {...answerConfig.promptConfidence, not_a_class: .9}};
+  assert.throws(() => Answers.create(classes, unknown), /Unknown answer class/);
+});
+test('345 metadata entries produce 186 easy, 50 selected hard, and 109 paused prompts', () => {
   const deck = Questions.create(classes, config);
-  assert.equal(config.questions.length,345);assert.equal(deck.count('easy'),189);assert.equal(deck.count('hard'),50);assert.equal(deck.pausedCount(),106);
+  assert.equal(config.questions.length,345);assert.equal(deck.count('easy'),186);assert.equal(deck.count('hard'),50);assert.equal(deck.pausedCount(),109);
   for(const key of ['calculator','piano','palm_tree','camera','cactus','washing_machine']){const q=config.questions.find(q=>q.key===key);assert.equal(q.level,'easy');assert.equal(q.enabled,true);}
   for(const key of ['ant','crocodile','spider','lobster','keyboard','dragon','animal_migration','camouflage','The_Mona_Lisa','aircraft_carrier'])assert.equal(config.questions.find(q=>q.key===key).enabled,false);
   for(const q of config.questions.filter(q=>!q.enabled))assert.ok(q.reviewReason);
@@ -71,7 +99,7 @@ test('old decks and later enable/disable changes cannot reintroduce paused promp
 });
 test('unavailable storage retains an in-memory deck',()=>{
   const deck=Questions.create(classes,config,{storage:{getItem(){throw Error('blocked');}},random:random(1)});
-  assert.equal(deck.persistent(),false);const seen=new Set();for(let i=0;i<189;i++)seen.add(deck.next('easy')[0]);assert.equal(seen.size,189);
+  assert.equal(deck.persistent(),false);const seen=new Set();for(let i=0;i<186;i++)seen.add(deck.next('easy')[0]);assert.equal(seen.size,186);
 });
 test('clock grants three preparation seconds then twenty drawing seconds',()=>{
   let now=100;const c=Clock.create({now:()=>now});c.start();assert.equal(c.read().phase,'preparing');assert.equal(c.read().secondsLeft,3);
@@ -141,7 +169,7 @@ test('practice stays untimed and consumes no formal questions',async()=>{
 test('exiting during preparation consumes only the prompt already shown',async()=>{
   const a=await app();a.click('startButton');a.click('exitButton');a.click('confirmExit');a.advance(100000);
   assert.equal(a.nodes.get('homeScreen').hidden,false);const state=JSON.parse(a.context.localStorage.getItem('quickdraw-1024-deck-v1'));
-  assert.equal(state.easy.remaining.length,188);assert.equal(state.easy.recent.length,1);assert.equal(state.hard.remaining.length,0);
+  assert.equal(state.easy.remaining.length,185);assert.equal(state.easy.recent.length,1);assert.equal(state.hard.remaining.length,0);
 });
 test('actual scoring controller grants 1 easy stamp and 2 hard stamps',async()=>{
   for(const [level,expected] of [['easy','1'],['hard','2']]){
@@ -149,7 +177,7 @@ test('actual scoring controller grants 1 easy stamp and 2 hard stamps',async()=>
     for(let round=0;round<2;round++){
       const zh=a.nodes.get('targetName').textContent;
       const names=Object.fromEntries(html.match(/const names = `([^`]+)`/)[1].split('|').map(x=>x.split('=')));Object.assign(names,embedded('embeddedAnswerRules').labelOverrides);
-      const key=classes.find(k=>names[k]===zh);assert.ok(key);a.setPrediction(key);
+      const key=classes.find(k=>names[k]===zh);assert.ok(key);a.setPrediction(key,1);
       for(let stroke=0;stroke<(level==='hard'?5:1);stroke++){
         a.pointer('pointerdown',100,100+stroke*35);a.pointer('pointermove',200,200+stroke*35);a.pointer('pointermove',300,100+stroke*35);a.pointer('pointerup');
       }
@@ -157,6 +185,20 @@ test('actual scoring controller grants 1 easy stamp and 2 hard stamps',async()=>
     }
     assert.equal(a.nodes.get('earnedCount').textContent,expected);assert.equal(a.nodes.get('resultScreen').hidden,false);
   }
+});
+
+test('a loose match that used to win now times out instead of scoring',async()=>{
+  const a=await app();a.click('startButton');
+  const names=Object.fromEntries(html.match(/const names = `([^`]+)`/)[1].split('|').map(x=>x.split('=')));
+  Object.assign(names,embedded('embeddedAnswerRules').labelOverrides);
+  const key=classes.find(k=>names[k]===a.nodes.get('targetName').textContent);
+  // The correct class at the former 22% bar must no longer finish the round.
+  a.setPrediction(key,.25);
+  a.pointer('pointerdown',100,100);a.pointer('pointermove',200,200);a.pointer('pointermove',300,100);a.pointer('pointerup');
+  a.advance(500);await a.flush();
+  assert.equal(a.nodes.get('roundOverlay').hidden,true);
+  assert.match(a.nodes.get('guessText').textContent,/我猜/);
+  a.advance(23000);assert.equal(a.nodes.get('roundMessage').textContent,'这次还差一点');
 });
 
 test('hard mode draws the fifty reviewed prompts and excludes quick outline examples', () => {
