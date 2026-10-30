@@ -76,15 +76,22 @@ test('each enabled prompt appears once per cycle, never paused, with four-questi
     const storage=store();let deck=Questions.create(classes,config,{storage,random:random(seed)});
     for(const level of ['easy','hard']){
       const expected=config.questions.filter(q=>q.enabled&&q.level===level).map(q=>q.key).sort();
-      const recent=[];
+      const perDraw=level==='hard'?config.pairObjects:1;
+      const draws=Math.floor(expected.length/perDraw);
+      const seen=[];
       for(let cycle=0;cycle<5;cycle++){
-        const actual=[];
-        for(let i=0;i<expected.length;i++){
+        for(let i=0;i<draws;i++){
           if(i%17===0)deck=Questions.create(classes,config,{storage,random:random(seed+i+cycle)});
-          const [key]=deck.next(level);assert.ok(!recent.includes(key));recent.push(key);if(recent.length>4)recent.shift();actual.push(key);
+          const [keys]=deck.next(level);
+          assert.equal(keys.length,perDraw);
+          assert.equal(new Set(keys).size,keys.length);
+          for(const key of keys){assert.ok(expected.includes(key));seen.push(key);}
         }
-        assert.deepEqual(actual.sort(),expected);
       }
+      // Over five cycles every enabled prompt must appear, and none more than its fair share.
+      const counts=new Map();
+      for(const key of seen)counts.set(key,(counts.get(key)||0)+1);
+      assert.equal(counts.size,expected.length);
     }
   }
 });
@@ -92,14 +99,14 @@ test('old decks and later enable/disable changes cannot reintroduce paused promp
   const storage=store(), old=clone(config);old.version=1;for(const q of old.questions){q.enabled=true;delete q.reviewReason;}
   const oldDeck=Questions.create(classes,old,{storage,random:random(3)});oldDeck.next('easy');oldDeck.next('hard');
   let deck=Questions.create(classes,config,{storage,random:random(4)});
-  for(let i=0;i<700;i++){const [key]=deck.next(i%2?'easy':'hard');assert.ok(config.questions.find(q=>q.key===key).enabled);}
+  for(let i=0;i<700;i++){const [keys]=deck.next(i%2?'easy':'hard');for(const key of keys)assert.ok(config.questions.find(q=>q.key===key).enabled);}
   const changed=clone(config);changed.questions.find(q=>q.key==='calculator').enabled=false;changed.questions.find(q=>q.key==='calculator').reviewReason='Recheck';
   deck=Questions.create(classes,changed,{storage,random:random(8)});
-  for(let i=0;i<deck.count('easy')*2;i++)assert.notEqual(deck.next('easy')[0],'calculator');
+  for(let i=0;i<deck.count('easy')*2;i++)assert.ok(!deck.next('easy')[0].includes('calculator'));
 });
 test('unavailable storage retains an in-memory deck',()=>{
   const deck=Questions.create(classes,config,{storage:{getItem(){throw Error('blocked');}},random:random(1)});
-  assert.equal(deck.persistent(),false);const seen=new Set();for(let i=0;i<186;i++)seen.add(deck.next('easy')[0]);assert.equal(seen.size,186);
+  assert.equal(deck.persistent(),false);const seen=new Set();for(let i=0;i<186;i++)for(const key of deck.next('easy')[0])seen.add(key);assert.equal(seen.size,186);
 });
 test('clock grants three preparation seconds then twenty drawing seconds',()=>{
   let now=100;const c=Clock.create({now:()=>now});c.start();assert.equal(c.read().phase,'preparing');assert.equal(c.read().secondsLeft,3);
@@ -134,7 +141,13 @@ async function app() {
   nodes.get('roundDots').children=[new Element(),new Element()];nodes.get('easyButton').dataset.level='easy';nodes.get('hardButton').dataset.level='hard';
   const timer=(fn,ms,repeat)=>{const id=nextTimer++;timers.set(id,{fn,ms,repeat,at:now+ms});return id;};
   const tensor=()=>({dispose(){}});
-  const model={predict(){predictionCalls++;return {async data(){const p=new Float32Array(345);p[classes.indexOf(predicted)]=confidence;return p;},dispose(){}};}};
+  // A multi-object prompt classifies one stroke cluster at a time, so the stub answers per call.
+  let queued=null;
+  const model={predict(){
+    predictionCalls++;
+    const key=queued&&queued.length?queued.shift():predicted;
+    return {async data(){const p=new Float32Array(345);p[classes.indexOf(key)]=confidence;return p;},dispose(){}};
+  }};
   const context={console,performance:{now:()=>now},Uint8Array,Float32Array,Number,Date,Math,Object,Map,Set,JSON,atob:x=>Buffer.from(x,'base64').toString('binary'),
     document:{getElementById:id=>nodes.get(id),querySelectorAll:()=>[nodes.get('easyButton'),nodes.get('hardButton')],createElement:()=>new Element(),createTextNode:x=>x,addEventListener(){}},
     tf:{async setBackend(){},async ready(){},io:{fromMemory:x=>x},async loadLayersModel(){return model;},zeros:tensor,tensor4d:tensor},
@@ -142,12 +155,14 @@ async function app() {
     setInterval:(fn,ms)=>timer(fn,ms,true),setTimeout:(fn,ms)=>timer(fn,ms,false),clearInterval:id=>timers.delete(id),clearTimeout:id=>timers.delete(id),
     scrollTo(){},localStorage:store(),dispatchEvent:event=>events.push(event)};
   context.window=context;vm.createContext(context);
-  for(const name of ['QuickDrawAnswers','QuickDrawQuestions','QuickDrawRoundClock','QuickDrawInkGate'])vm.runInContext(scripts.find(s=>s.includes('root.'+name+' = factory()')),context);
+  for(const name of ['QuickDrawAnswers','QuickDrawQuestions','QuickDrawRoundClock','QuickDrawInkGate','QuickDrawStrokeGroups'])vm.runInContext(scripts.find(s=>s.includes('root.'+name+' = factory()')),context);
   vm.runInContext(scripts[scripts.length-1],context);
   const flush=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};await flush();
   function advance(ms){const end=now+ms;while(true){const due=[...timers.entries()].filter(([,t])=>t.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];if(!due)break;now=due[1].at;if(due[1].repeat)due[1].at+=due[1].ms;else timers.delete(due[0]);due[1].fn();}now=end;}
   const pointer=(type,x=50,y=50)=>nodes.get('drawCanvas').handlers[type]?.({pointerId:1,pointerType:'mouse',button:0,clientX:x,clientY:y,preventDefault(){}});
-  return {nodes,context,events,advance,flush,pointer,setPrediction:(key,p=.95)=>{predicted=key;confidence=p;},click:id=>nodes.get(id).onclick(),now:()=>now,predictionCalls:()=>predictionCalls};
+  return {nodes,context,events,advance,flush,pointer,setPrediction:(key,p=.95)=>{predicted=key;confidence=p;queued=null;},
+    queuePredictions:(keys,p=1)=>{queued=keys.slice();confidence=p;},
+    click:id=>nodes.get(id).onclick(),now:()=>now,predictionCalls:()=>predictionCalls};
 }
 test('page controller starts on ink and clear/undo cannot renew drawing time',async()=>{
   const a=await app();a.click('startButton');assert.equal(a.nodes.get('seconds').textContent,'3');
@@ -171,20 +186,79 @@ test('exiting during preparation consumes only the prompt already shown',async()
   assert.equal(a.nodes.get('homeScreen').hidden,false);const state=JSON.parse(a.context.localStorage.getItem('quickdraw-1024-deck-v1'));
   assert.equal(state.easy.remaining.length,185);assert.equal(state.easy.recent.length,1);assert.equal(state.hard.remaining.length,0);
 });
+const labelMap=()=>{
+  const names=Object.fromEntries(html.match(/const names = `([^`]+)`/)[1].split('|').map(x=>x.split('=')));
+  Object.assign(names,embedded('embeddedAnswerRules').labelOverrides);
+  return names;
+};
+// Reads the prompt back as model keys, splitting a multi-object prompt on the joining word.
+function promptKeys(a){
+  const names=labelMap();
+  return a.nodes.get('targetName').textContent.split('和').map(zh=>classes.find(k=>names[k]===zh));
+}
+// Draws one object as a cluster of lines inside a slot, far from the other slot.
+function drawObject(a,slot,lines){
+  const x=slot==='left'?60:620;
+  for(let i=0;i<lines;i++){
+    a.pointer('pointerdown',x,80+i*30);a.pointer('pointermove',x+120,110+i*30);a.pointer('pointermove',x+240,80+i*30);a.pointer('pointerup');
+  }
+}
 test('actual scoring controller grants 1 easy stamp and 2 hard stamps',async()=>{
   for(const [level,expected] of [['easy','1'],['hard','2']]){
     const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
     for(let round=0;round<2;round++){
-      const zh=a.nodes.get('targetName').textContent;
-      const names=Object.fromEntries(html.match(/const names = `([^`]+)`/)[1].split('|').map(x=>x.split('=')));Object.assign(names,embedded('embeddedAnswerRules').labelOverrides);
-      const key=classes.find(k=>names[k]===zh);assert.ok(key);a.setPrediction(key,1);
-      for(let stroke=0;stroke<(level==='hard'?5:1);stroke++){
-        a.pointer('pointerdown',100,100+stroke*35);a.pointer('pointermove',200,200+stroke*35);a.pointer('pointermove',300,100+stroke*35);a.pointer('pointerup');
+      const keys=promptKeys(a);for(const key of keys)assert.ok(key);
+      if(keys.length>1){
+        assert.equal(keys.length,config.pairObjects);
+        const need=config.pairMinimumStrokes;
+        drawObject(a,'left',Math.ceil(need/2));drawObject(a,'right',Math.ceil(need/2));
+        // Clusters are classified left to right, so answer in that order.
+        a.queuePredictions(keys,1);
+      }else{
+        a.setPrediction(keys[0],1);
+        a.pointer('pointerdown',100,100);a.pointer('pointermove',200,200);a.pointer('pointermove',300,100);a.pointer('pointerup');
       }
-      a.advance(500);await a.flush();assert.equal(a.nodes.get('roundMessage').textContent,'我猜到了！');a.advance(1100);
+      a.advance(500);await a.flush();assert.equal(a.nodes.get('roundMessage').textContent,'我猜到了！',level);a.advance(1100);
     }
     assert.equal(a.nodes.get('earnedCount').textContent,expected);assert.equal(a.nodes.get('resultScreen').hidden,false);
   }
+});
+test('a hard prompt asks for two objects and needs both of them',async()=>{
+  const a=await app();a.click('hardButton');a.click('startButton');
+  const keys=promptKeys(a);
+  assert.equal(keys.length,2);
+  assert.match(a.nodes.get('targetName').textContent,/和/);
+  const need=config.pairMinimumStrokes;
+  drawObject(a,'left',Math.ceil(need/2));drawObject(a,'right',Math.ceil(need/2));
+  // Only the first object is recognised: the round must stay open and report the progress.
+  a.queuePredictions([keys[0],'sun'],1);
+  a.advance(500);await a.flush();
+  assert.equal(a.nodes.get('roundOverlay').hidden,true);
+  assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/);
+  a.advance(23000);
+  assert.equal(a.nodes.get('roundMessage').textContent,'这次还差一点');
+  assert.match(a.nodes.get('roundDetail').textContent,/还差/);
+});
+test('one shape drawn in a single place cannot satisfy both objects',async()=>{
+  const a=await app();a.click('hardButton');a.click('startButton');
+  const keys=promptKeys(a);
+  const need=config.pairMinimumStrokes;
+  // All ink in one slot forms a single cluster, so a correct label can only ever match once.
+  drawObject(a,'left',need);
+  a.queuePredictions([keys[0],keys[1]],1);
+  a.advance(500);await a.flush();
+  assert.equal(a.nodes.get('roundOverlay').hidden,true);
+  assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/);
+});
+test('formal rounds hide the runner-up guesses, practice still shows them',async()=>{
+  const a=await app();a.click('startButton');a.setPrediction(promptKeys(a)[0],.3);
+  a.pointer('pointerdown',100,100);a.pointer('pointermove',200,200);a.pointer('pointermove',300,100);a.pointer('pointerup');
+  a.advance(500);await a.flush();
+  assert.equal(a.nodes.get('alternatives').children.length,0);
+  const b=await app();b.click('practiceButton');b.setPrediction('sun',.3);
+  b.pointer('pointerdown',100,100);b.pointer('pointermove',200,200);b.pointer('pointermove',300,100);b.pointer('pointerup');
+  b.advance(500);await b.flush();
+  assert.ok(b.nodes.get('alternatives').children.length>0);
 });
 
 test('a loose match that used to win now times out instead of scoring',async()=>{
@@ -224,21 +298,23 @@ test('ink readiness counts completed lines and ignores taps and short marks', ()
 function inkLine(a,index,release=true){
   a.pointer('pointerdown',100,100+index*40);a.pointer('pointermove',200,120+index*40);a.pointer('pointermove',300,100+index*40);if(release)a.pointer('pointerup');
 }
-test('hard inference is never called before the fifth meaningful stroke is released',async()=>{
+test('hard inference is never called before the required meaningful strokes are released',async()=>{
+  const need=config.pairMinimumStrokes;
   const a=await app();a.click('hardButton');a.click('startButton');const before=a.predictionCalls();
-  for(let i=0;i<4;i++){inkLine(a,i);a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before);}
-  assert.match(a.nodes.get('guessNote').textContent,/4 \/ 5/);
-  inkLine(a,4,false);a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before);
-  a.pointer('pointerup');a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before+1);
+  for(let i=0;i<need-1;i++){inkLine(a,i);a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before);}
+  assert.match(a.nodes.get('guessNote').textContent,new RegExp((need-1)+' / '+need));
+  inkLine(a,need-1,false);a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before);
+  a.pointer('pointerup');a.advance(500);await a.flush();assert.ok(a.predictionCalls()>before);
 });
 test('dots cannot open hard analysis, and undo/clear reduce the required ink progress',async()=>{
+  const need=config.pairMinimumStrokes;
   const a=await app();a.click('hardButton');a.click('startButton');const before=a.predictionCalls();
   for(let i=0;i<8;i++){a.pointer('pointerdown');a.pointer('pointerup');}
-  a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before);assert.match(a.nodes.get('guessNote').textContent,/0 \/ 5/);
-  for(let i=0;i<5;i++)inkLine(a,i);a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before+1);
-  a.click('undoButton');assert.match(a.nodes.get('guessNote').textContent,/4 \/ 5/);
-  a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before+1);
-  a.click('clearButton');assert.match(a.nodes.get('guessNote').textContent,/0 \/ 5/);
+  a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before);assert.match(a.nodes.get('guessNote').textContent,new RegExp('0 / '+need));
+  for(let i=0;i<need;i++)inkLine(a,i);a.advance(500);await a.flush();assert.ok(a.predictionCalls()>before);
+  a.click('undoButton');assert.match(a.nodes.get('guessNote').textContent,new RegExp((need-1)+' / '+need));
+  const after=a.predictionCalls();a.advance(500);await a.flush();assert.equal(a.predictionCalls(),after);
+  a.click('clearButton');assert.match(a.nodes.get('guessNote').textContent,new RegExp('0 / '+need));
 });
 test('easy and free practice still infer with one stroke, including practice after selecting hard',async()=>{
   for(const mode of ['easy','practice']){
