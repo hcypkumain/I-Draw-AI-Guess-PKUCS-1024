@@ -76,7 +76,7 @@ test('each enabled prompt appears once per cycle, never paused, with four-questi
     const storage=store();let deck=Questions.create(classes,config,{storage,random:random(seed)});
     for(const level of ['easy','hard']){
       const expected=config.questions.filter(q=>q.enabled&&q.level===level).map(q=>q.key).sort();
-      const perDraw=level==='hard'?config.pairObjects:1;
+      const perDraw=config.pairObjects;
       const draws=Math.floor(expected.length/perDraw);
       const seen=[];
       for(let cycle=0;cycle<5;cycle++){
@@ -184,7 +184,10 @@ test('practice stays untimed and consumes no formal questions',async()=>{
 test('exiting during preparation consumes only the prompt already shown',async()=>{
   const a=await app();a.click('startButton');a.click('exitButton');a.click('confirmExit');a.advance(100000);
   assert.equal(a.nodes.get('homeScreen').hidden,false);const state=JSON.parse(a.context.localStorage.getItem('quickdraw-1024-deck-v1'));
-  assert.equal(state.easy.remaining.length,185);assert.equal(state.easy.recent.length,1);assert.equal(state.hard.remaining.length,0);
+  // One prompt was shown, consuming pairObjects entries from the easy bank.
+  assert.equal(state.easy.remaining.length,186-config.pairObjects);
+  assert.equal(state.easy.recent.length,config.pairObjects);
+  assert.equal(state.hard.remaining.length,0);
 });
 const labelMap=()=>{
   const names=Object.fromEntries(html.match(/const names = `([^`]+)`/)[1].split('|').map(x=>x.split('=')));
@@ -203,52 +206,79 @@ function drawObject(a,slot,lines){
     a.pointer('pointerdown',x,80+i*30);a.pointer('pointermove',x+120,110+i*30);a.pointer('pointermove',x+240,80+i*30);a.pointer('pointerup');
   }
 }
+const strokesFor=level=>level==='hard'?config.pairMinimumStrokes:config.easyMinimumStrokes;
 test('actual scoring controller grants 1 easy stamp and 2 hard stamps',async()=>{
   for(const [level,expected] of [['easy','1'],['hard','2']]){
     const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
     for(let round=0;round<2;round++){
       const keys=promptKeys(a);for(const key of keys)assert.ok(key);
-      if(keys.length>1){
-        assert.equal(keys.length,config.pairObjects);
-        const need=config.pairMinimumStrokes;
+      assert.equal(keys.length,config.pairObjects);
+      const need=strokesFor(level);
+      if(level==='hard'){
         drawObject(a,'left',Math.ceil(need/2));drawObject(a,'right',Math.ceil(need/2));
         // Clusters are classified left to right, so answer in that order.
         a.queuePredictions(keys,1);
       }else{
+        // Easy needs only one of the two named objects.
+        drawObject(a,'left',2);
         a.setPrediction(keys[0],1);
-        a.pointer('pointerdown',100,100);a.pointer('pointermove',200,200);a.pointer('pointermove',300,100);a.pointer('pointerup');
       }
       a.advance(500);await a.flush();assert.equal(a.nodes.get('roundMessage').textContent,'我猜到了！',level);a.advance(1100);
     }
     assert.equal(a.nodes.get('earnedCount').textContent,expected);assert.equal(a.nodes.get('resultScreen').hidden,false);
   }
 });
-test('a hard prompt asks for two objects and needs both of them',async()=>{
-  const a=await app();a.click('hardButton');a.click('startButton');
-  const keys=promptKeys(a);
-  assert.equal(keys.length,2);
-  assert.match(a.nodes.get('targetName').textContent,/和/);
-  const need=config.pairMinimumStrokes;
-  drawObject(a,'left',Math.ceil(need/2));drawObject(a,'right',Math.ceil(need/2));
-  // Only the first object is recognised: the round must stay open and report the progress.
-  a.queuePredictions([keys[0],'sun'],1);
-  a.advance(500);await a.flush();
-  assert.equal(a.nodes.get('roundOverlay').hidden,true);
-  assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/);
-  a.advance(23000);
-  assert.equal(a.nodes.get('roundMessage').textContent,'这次还差一点');
-  assert.match(a.nodes.get('roundDetail').textContent,/还差/);
+test('both levels name two objects and differ only in how many are required',async()=>{
+  for(const level of ['easy','hard']){
+    const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
+    assert.equal(promptKeys(a).length,2,level);
+    assert.match(a.nodes.get('targetName').textContent,/和/,level);
+  }
 });
-test('one shape drawn in a single place cannot satisfy both objects',async()=>{
+test('easy passes on one object while hard still needs the second',async()=>{
+  // Same drawing, same prediction: easy scores, hard does not.
+  for(const [level,shouldWin] of [['easy',true],['hard',false]]){
+    const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
+    const keys=promptKeys(a);
+    const need=Math.max(2,strokesFor(level));
+    drawObject(a,'left',Math.ceil(need/2));drawObject(a,'right',Math.ceil(need/2));
+    a.queuePredictions([keys[0],'sun'],1);
+    a.advance(500);await a.flush();
+    const won=!a.nodes.get('roundOverlay').hidden&&a.nodes.get('roundMessage').textContent==='我猜到了！';
+    assert.equal(won,shouldWin,level);
+    if(!shouldWin){
+      assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/);
+      a.advance(23000);
+      assert.equal(a.nodes.get('roundMessage').textContent,'这次还差一点');
+      assert.match(a.nodes.get('roundDetail').textContent,/还差 1 个/);
+    }
+  }
+});
+test('one shape drawn in a single place cannot satisfy both hard objects',async()=>{
   const a=await app();a.click('hardButton');a.click('startButton');
   const keys=promptKeys(a);
-  const need=config.pairMinimumStrokes;
   // All ink in one slot forms a single cluster, so a correct label can only ever match once.
-  drawObject(a,'left',need);
+  drawObject(a,'left',config.pairMinimumStrokes);
   a.queuePredictions([keys[0],keys[1]],1);
   a.advance(500);await a.flush();
   assert.equal(a.nodes.get('roundOverlay').hidden,true);
   assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/);
+});
+test('easy uses the strict single-object bars, hard the relaxed paired bars',()=>{
+  const answerConfig=embedded('embeddedAnswerRules');
+  const policy=Answers.create(classes,answerConfig);
+  for(const key of ['angel','strawberry','barn']){
+    const strict=policy.thresholdFor(key),relaxed=policy.pairThresholdFor(key);
+    assert.ok(relaxed<=strict,key);
+    // Only the hard level relaxes the bar, so a confidence between the two must split the levels.
+    if(relaxed<strict){
+      const between=(relaxed+strict)/2;
+      assert.equal(policy.assess(key,{key,confidence:between},true).accepted,true,key);
+      assert.equal(policy.assess(key,{key,confidence:between},false).accepted,false,key);
+    }
+  }
+  assert.deepEqual(config.objectsNeeded,{easy:1,hard:2});
+  assert.equal(config.pairObjects,2);
 });
 test('formal rounds hide the runner-up guesses, practice still shows them',async()=>{
   const a=await app();a.click('startButton');a.setPrediction(promptKeys(a)[0],.3);
@@ -263,12 +293,10 @@ test('formal rounds hide the runner-up guesses, practice still shows them',async
 
 test('a loose match that used to win now times out instead of scoring',async()=>{
   const a=await app();a.click('startButton');
-  const names=Object.fromEntries(html.match(/const names = `([^`]+)`/)[1].split('|').map(x=>x.split('=')));
-  Object.assign(names,embedded('embeddedAnswerRules').labelOverrides);
-  const key=classes.find(k=>names[k]===a.nodes.get('targetName').textContent);
+  const key=promptKeys(a)[0];
   // The correct class at the former 22% bar must no longer finish the round.
   a.setPrediction(key,.25);
-  a.pointer('pointerdown',100,100);a.pointer('pointermove',200,200);a.pointer('pointermove',300,100);a.pointer('pointerup');
+  drawObject(a,'left',2);
   a.advance(500);await a.flush();
   assert.equal(a.nodes.get('roundOverlay').hidden,true);
   assert.match(a.nodes.get('guessText').textContent,/我猜/);
@@ -316,9 +344,13 @@ test('dots cannot open hard analysis, and undo/clear reduce the required ink pro
   const after=a.predictionCalls();a.advance(500);await a.flush();assert.equal(a.predictionCalls(),after);
   a.click('clearButton');assert.match(a.nodes.get('guessNote').textContent,new RegExp('0 / '+need));
 });
-test('easy and free practice still infer with one stroke, including practice after selecting hard',async()=>{
+test('easy and free practice still infer from the first stroke, including practice after selecting hard',async()=>{
+  // Easy names two objects but needs only one, and many easy objects are drawn in one or two
+  // strokes, so easy must keep guessing from the first stroke.
+  assert.equal(config.easyMinimumStrokes,0);
   for(const mode of ['easy','practice']){
     const a=await app();if(mode==='practice')a.click('hardButton');a.click(mode==='practice'?'practiceButton':'startButton');
-    const before=a.predictionCalls();inkLine(a,0);a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before+1);
+    const before=a.predictionCalls();inkLine(a,0);a.advance(500);await a.flush();
+    assert.ok(a.predictionCalls()>before,mode);
   }
 });
