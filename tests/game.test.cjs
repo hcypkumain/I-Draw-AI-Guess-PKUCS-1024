@@ -71,15 +71,15 @@ test('both levels draw one object and differ only in how many prompts must pass'
   assert.equal(config.singleMinimumStrokes, 0);
   assert.ok(!('pairMinimumStrokes' in config));
 });
-test('both levels share one pool of 342 calibrated objects', () => {
+test('both levels share one pool of 337 calibrated objects', () => {
   const deck = Questions.create(classes, config);
   assert.equal(config.questions.length,345);
   const enabled = config.questions.filter(q=>q.enabled!==false);
-  assert.equal(enabled.length,342);
+  assert.equal(enabled.length,337);
   // The shared pool means both levels report the same bank.
-  assert.equal(deck.count('easy'),342);
-  assert.equal(deck.count('hard'),342);
-  assert.equal(deck.pausedCount(),345-342);
+  assert.equal(deck.count('easy'),337);
+  assert.equal(deck.count('hard'),337);
+  assert.equal(deck.pausedCount(),345-337);
   // Membership now comes from the two-object screening, not the old per-level lists.
   for(const q of config.questions.filter(q=>!q.enabled))assert.ok(q.reviewReason,q.key);
   for(const q of enabled)assert.ok(q.pinyin,q.key);
@@ -237,10 +237,20 @@ function drawObject(a,slot,lines){
     a.pointer('pointerdown',x,80+i*30);a.pointer('pointermove',x+120,110+i*30);a.pointer('pointermove',x+240,80+i*30);a.pointer('pointerup');
   }
 }
-// One object per prompt, so a single cluster of lines is enough.
-function drawOne(a,key){
+// Adds one fresh line, offset so each call changes the drawing and triggers a new reading.
+function addLine(a,index){
+  const y=80+index*30;
+  a.pointer('pointerdown',60,y);a.pointer('pointermove',180,y+30);a.pointer('pointermove',300,y);a.pointer('pointerup');
+}
+// One object per prompt. The answer must hold across consecutive checks, so the drawing
+// grows between checks to produce fresh readings.
+async function drawOne(a,key){
   a.setPrediction(key,1);
-  drawObject(a,'left',2);
+  const need=embedded('embeddedAnswerRules').requiredStreak;
+  for(let i=0;i<need;i++){
+    addLine(a,i);
+    a.advance(500);await a.flush();
+  }
 }
 test('actual scoring controller grants 1 easy stamp and 2 hard stamps',async()=>{
   for(const [level,expected] of [['easy','1'],['hard','2']]){
@@ -249,8 +259,8 @@ test('actual scoring controller grants 1 easy stamp and 2 hard stamps',async()=>
       const keys=promptKeys(a);
       assert.equal(keys.length,1,level);
       assert.ok(keys[0]);
-      drawOne(a,keys[0]);
-      a.advance(500);await a.flush();assert.equal(a.nodes.get('roundMessage').textContent,'我猜到了！',level);a.advance(1100);
+      await drawOne(a,keys[0]);
+      assert.equal(a.nodes.get('roundMessage').textContent,'我猜到了！',level);a.advance(1100);
     }
     assert.equal(a.nodes.get('earnedCount').textContent,expected);assert.equal(a.nodes.get('resultScreen').hidden,false);
   }
@@ -266,13 +276,57 @@ test('the levels differ only in how many prompts must pass',async()=>{
   // One prompt passed, one timed out: easy earns a stamp, hard earns nothing.
   for(const [level,expected] of [['easy','1'],['hard','0']]){
     const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
-    drawOne(a,promptKeys(a)[0]);
-    a.advance(500);await a.flush();
+    await drawOne(a,promptKeys(a)[0]);
     assert.equal(a.nodes.get('roundMessage').textContent,'我猜到了！',level);
     a.advance(1100);
     a.advance(23000);a.advance(1100);
     assert.equal(a.nodes.get('earnedCount').textContent,expected,level);
   }
+});
+test('a single lucky reading never wins; the answer must hold for consecutive checks',async()=>{
+  const need=embedded('embeddedAnswerRules').requiredStreak;
+  assert.ok(need>=2,'a streak of one would let a single frame win');
+  const a=await app();a.click('startButton');
+  const key=promptKeys(a)[0];
+  const answerConfig=embedded('embeddedAnswerRules');
+  const variants=new Set(answerConfig.rules.filter(r=>r.target===key).flatMap(r=>r.accept));
+  const other=classes.find(k=>k!==key&&!variants.has(k));
+  // Correct for every check but the last one before the streak completes.
+  for(let i=0;i<need-1;i++){
+    a.setPrediction(key,1);
+    addLine(a,i);a.advance(500);await a.flush();
+    assert.equal(a.nodes.get('roundOverlay').hidden,true,'won after '+(i+1)+' of '+need);
+    assert.match(a.nodes.get('guessNote').textContent,new RegExp((i+1)+' / '+need));
+  }
+  // One wrong reading resets the run, so the next correct one cannot complete it.
+  a.setPrediction(other,1);
+  addLine(a,need);a.advance(500);await a.flush();
+  assert.equal(a.nodes.get('roundOverlay').hidden,true);
+  a.setPrediction(key,1);
+  addLine(a,need+1);a.advance(500);await a.flush();
+  assert.equal(a.nodes.get('roundOverlay').hidden,true,'streak must restart after a miss');
+  assert.match(a.nodes.get('guessNote').textContent,new RegExp('1 / '+need));
+});
+test('erasing resets the streak',async()=>{
+  const need=embedded('embeddedAnswerRules').requiredStreak;
+  const a=await app();a.click('startButton');
+  const key=promptKeys(a)[0];
+  a.setPrediction(key,1);
+  for(let i=0;i<need-1;i++){addLine(a,i);a.advance(500);await a.flush();}
+  assert.match(a.nodes.get('guessNote').textContent,new RegExp((need-1)+' / '+need));
+  a.click('clearButton');
+  // After clearing, a fresh run has to start from one again.
+  for(let i=0;i<need-1;i++){addLine(a,i);a.advance(500);await a.flush();}
+  assert.equal(a.nodes.get('roundOverlay').hidden,true,'cleared ink must not keep the old streak');
+});
+test('bars are calibrated high against well-drawn samples, with a streak on top',()=>{
+  const answerConfig=embedded('embeddedAnswerRules');
+  const enabled=config.questions.filter(q=>q.enabled!==false);
+  const bars=enabled.map(q=>answerConfig.promptConfidence[q.key]).sort((a,b)=>a-b);
+  assert.ok(bars[0]>=0.70,'floor should be 70%, got '+bars[0]);
+  const median=bars[Math.floor(bars.length/2)];
+  assert.ok(median>0.9,'median bar should demand a close match, got '+median);
+  assert.equal(answerConfig.requiredStreak,2);
 });
 test('a wrong label never scores, however confident the model is',async()=>{
   const a=await app();a.click('startButton');
@@ -312,9 +366,9 @@ test('a loose match that used to win now times out instead of scoring',async()=>
 
 test('the pool keeps nearly every class and records how each bar was set', () => {
   const enabled=config.questions.filter(q=>q.enabled!==false);
-  for(const q of enabled)assert.equal(q.calibration,'single-calibrated',q.key);
-  // Only classes the model essentially never returns are left out.
-  assert.equal(config.questions.length-enabled.length,3);
+  for(const q of enabled)assert.equal(q.calibration,'streak-calibrated',q.key);
+  // Only classes that cannot reach the target under the streak rule are left out.
+  assert.equal(config.questions.length-enabled.length,8);
   assert.ok(enabled.length>=150,'pool should hold at least 150 objects, got '+enabled.length);
 });
 
