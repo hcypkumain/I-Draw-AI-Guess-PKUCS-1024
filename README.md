@@ -2,7 +2,9 @@
 
 面向小学生与亲子家庭的绘画小游戏：玩家在平板或电脑上绘画，AI 实时猜测，工作人员根据结算发放活动标记。
 
-**[点击在线试玩](https://hcypkumain.github.io/I-Draw-AI-Guess-PKUCS-1024/)**
+**在线试玩：[双物体版](https://hcypkumain.github.io/I-Draw-AI-Guess-PKUCS-1024/)** · **[单物体高难度版](https://hcypkumain.github.io/I-Draw-AI-Guess-PKUCS-1024/hard/)**
+
+两个版本并行部署，便于现场对比：双物体版每题画两个东西、两个都要被认出；单物体版每题画一个，但要求 AI 连续两次稳定认出。配置与依据分别见各自的《难度调整说明》（单物体版在 `single-object-hard` 分支）。
 
 ## 玩法
 

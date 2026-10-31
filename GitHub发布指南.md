@@ -54,6 +54,19 @@ git push -u origin main
 - 试一局简单档和困难档，检查绘画、计时、换题和 1／2 个标记的结算。
 - 如果出现 404，先核对 Pages 部署是否完成、发布分支和文件夹是否正确、根目录是否有小写的 `index.html`。
 - 以后更新游戏，只需替换仓库中的 `index.html` 并提交；Pages 会自动重新发布。出现旧版本时刷新页面，电脑可尝试 `Ctrl+F5`。
+
+## 两个并行的试玩版本
+
+仓库同时发布两个独立页面，便于现场对比难度：
+
+| 版本 | 地址 | 玩法 |
+| --- | --- | --- |
+| 双物体版 | `https://hcypkumain.github.io/I-Draw-AI-Guess-PKUCS-1024/` | 每题画两个东西，两个都要被认出 |
+| 单物体版 | `https://hcypkumain.github.io/I-Draw-AI-Guess-PKUCS-1024/hard/` | 每题画一个东西，需连续两次稳定识别 |
+
+两个页面各自独立运行，互不影响；页脚有互相跳转的链接。单物体版的文件是 `hard/index.html`，由 `single-object-hard` 分支的 `index.html` 复制而来，只改了标题、页脚链接。
+
+GitHub Pages 一个仓库只能发布一个分支，所以第二个版本放在 `main` 分支的子目录里，而不是单独发布 `single-object-hard` 分支。要更新单物体版时，在该分支改好后重新复制一份到 `hard/index.html` 并提交。
 - 现场笔记本加平板的局域网方案可以继续使用；它不依赖 Pages 网站是否可访问。
 
 ## 模型来源与公开使用
