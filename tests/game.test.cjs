@@ -32,23 +32,30 @@ test('model and answer rules retain their original semantics', () => {
     assert.equal(policy.assess(target, {key,confidence:.219}).accepted, false);
   }
 });
-test('each enabled prompt carries a calibrated confidence bar that only accepts very close drawings', () => {
+test('each object in the shared pool carries a calibrated bar used for scoring', () => {
   const answerConfig = embedded('embeddedAnswerRules'), policy = Answers.create(classes, answerConfig);
   const enabled = config.questions.filter(q => q.enabled !== false);
-  assert.equal(Object.keys(answerConfig.promptConfidence).length, enabled.length);
+  // Scoring always uses the paired table, since every prompt draws two objects.
+  assert.equal(Object.keys(answerConfig.pairConfidence).length, enabled.length);
   for (const question of enabled) {
-    const bar = answerConfig.promptConfidence[question.key];
+    const bar = answerConfig.pairConfidence[question.key];
+    assert.ok(bar !== undefined, question.key);
     assert.ok(bar >= answerConfig.minimumConfidence && bar <= 1, question.key);
-    assert.equal(policy.thresholdFor(question.key), bar);
-    // Just below the prompt's own bar must fail even for the exact class.
-    assert.equal(policy.assess(question.key, {key: question.key, confidence: bar - 1e-4}).accepted, false, question.key);
-    assert.equal(policy.assess(question.key, {key: question.key, confidence: bar}).accepted, true, question.key);
+    assert.equal(policy.pairThresholdFor(question.key), bar);
+    // Just below the object's own bar must fail even for the exact class.
+    assert.equal(policy.assess(question.key, {key: question.key, confidence: bar - 1e-4}, true).accepted, false, question.key);
+    assert.equal(policy.assess(question.key, {key: question.key, confidence: bar}, true).accepted, true, question.key);
   }
-  // The old flat 22% bar must no longer pass a typical prompt.
-  const median = Object.values(answerConfig.promptConfidence).sort((a,b)=>a-b)[Math.floor(enabled.length/2)];
-  assert.ok(median > .9, 'median bar should demand a close match, got ' + median);
+  // The old flat 22% bar must no longer pass a typical object.
+  const bars = enabled.map(q => answerConfig.pairConfidence[q.key]).sort((a,b)=>a-b);
+  const median = bars[Math.floor(bars.length/2)];
+  assert.ok(median > .7, 'median bar should demand a close match, got ' + median);
+  assert.ok(bars[0] > answerConfig.minimumConfidence, 'no object may sit on the global floor');
   for (const key of ['square','circle','line'])
     assert.equal(config.questions.find(q=>q.key===key).enabled, false, key + ' is unrecognisable and must stay paused');
+  // Objects the model cannot recognise once two share the canvas are paused too.
+  for (const key of ['spoon','triangle','zigzag'])
+    assert.equal(config.questions.find(q=>q.key===key).enabled, false, key + ' must stay paused for pair prompts');
 });
 test('prompt bars below the floor or above one are rejected', () => {
   const answerConfig = embedded('embeddedAnswerRules');
@@ -59,12 +66,27 @@ test('prompt bars below the floor or above one are rejected', () => {
   const unknown = {...answerConfig, promptConfidence: {...answerConfig.promptConfidence, not_a_class: .9}};
   assert.throws(() => Answers.create(classes, unknown), /Unknown answer class/);
 });
-test('345 metadata entries produce 186 easy, 50 selected hard, and 109 paused prompts', () => {
+test('both levels share one screened pool of 88 objects', () => {
   const deck = Questions.create(classes, config);
-  assert.equal(config.questions.length,345);assert.equal(deck.count('easy'),186);assert.equal(deck.count('hard'),50);assert.equal(deck.pausedCount(),109);
-  for(const key of ['calculator','piano','palm_tree','camera','cactus','washing_machine']){const q=config.questions.find(q=>q.key===key);assert.equal(q.level,'easy');assert.equal(q.enabled,true);}
+  assert.equal(config.questions.length,345);
+  const enabled = config.questions.filter(q=>q.enabled!==false);
+  assert.equal(enabled.length,88);
+  // The shared pool means both levels report the same bank.
+  assert.equal(deck.count('easy'),88);
+  assert.equal(deck.count('hard'),88);
+  assert.equal(deck.pausedCount(),345-88);
+  assert.equal(config.sharedPool,true);
   for(const key of ['ant','crocodile','spider','lobster','keyboard','dragon','animal_migration','camouflage','The_Mona_Lisa','aircraft_carrier'])assert.equal(config.questions.find(q=>q.key===key).enabled,false);
-  for(const q of config.questions.filter(q=>!q.enabled))assert.ok(q.reviewReason);
+  for(const q of config.questions.filter(q=>!q.enabled))assert.ok(q.reviewReason,q.key);
+});
+test('the shared deck serves the same objects to either level', () => {
+  const storage=store();
+  const easy=Questions.create(classes,config,{storage,random:random(5)});
+  const [first]=easy.next('easy');
+  const hard=Questions.create(classes,config,{storage,random:random(5)});
+  const [second]=hard.next('hard');
+  // A prompt consumed as easy must not come back immediately as hard.
+  for(const key of second)assert.ok(!first.includes(key));
 });
 test('invalid flags, missing pause reasons and missing metadata fail validation', () => {
   let c=clone(config);c.questions[0].enabled='no';assert.throws(()=>Questions.create(classes,c),/Invalid question/);
@@ -75,7 +97,7 @@ test('each enabled prompt appears once per cycle, never paused, with four-questi
   for(let seed=1;seed<=20;seed++) {
     const storage=store();let deck=Questions.create(classes,config,{storage,random:random(seed)});
     for(const level of ['easy','hard']){
-      const expected=config.questions.filter(q=>q.enabled&&q.level===level).map(q=>q.key).sort();
+      const expected=config.questions.filter(q=>q.enabled!==false).map(q=>q.key).sort();
       const perDraw=config.pairObjects;
       const draws=Math.floor(expected.length/perDraw);
       const seen=[];
@@ -88,7 +110,7 @@ test('each enabled prompt appears once per cycle, never paused, with four-questi
           for(const key of keys){assert.ok(expected.includes(key));seen.push(key);}
         }
       }
-      // Over five cycles every enabled prompt must appear, and none more than its fair share.
+      // Over five cycles every object in the shared pool must appear.
       const counts=new Map();
       for(const key of seen)counts.set(key,(counts.get(key)||0)+1);
       assert.equal(counts.size,expected.length);
@@ -106,7 +128,11 @@ test('old decks and later enable/disable changes cannot reintroduce paused promp
 });
 test('unavailable storage retains an in-memory deck',()=>{
   const deck=Questions.create(classes,config,{storage:{getItem(){throw Error('blocked');}},random:random(1)});
-  assert.equal(deck.persistent(),false);const seen=new Set();for(let i=0;i<186;i++)for(const key of deck.next('easy')[0])seen.add(key);assert.equal(seen.size,186);
+  const pool=config.questions.filter(q=>q.enabled!==false).length;
+  assert.equal(deck.persistent(),false);
+  const seen=new Set();
+  for(let i=0;i<pool;i++)for(const key of deck.next('easy')[0])seen.add(key);
+  assert.equal(seen.size,pool);
 });
 test('clock grants three preparation seconds then twenty drawing seconds',()=>{
   let now=100;const c=Clock.create({now:()=>now});c.start();assert.equal(c.read().phase,'preparing');assert.equal(c.read().secondsLeft,3);
@@ -184,10 +210,10 @@ test('practice stays untimed and consumes no formal questions',async()=>{
 test('exiting during preparation consumes only the prompt already shown',async()=>{
   const a=await app();a.click('startButton');a.click('exitButton');a.click('confirmExit');a.advance(100000);
   assert.equal(a.nodes.get('homeScreen').hidden,false);const state=JSON.parse(a.context.localStorage.getItem('quickdraw-1024-deck-v1'));
-  // One prompt was shown, consuming pairObjects entries from the easy bank.
-  assert.equal(state.easy.remaining.length,186-config.pairObjects);
-  assert.equal(state.easy.recent.length,config.pairObjects);
-  assert.equal(state.hard.remaining.length,0);
+  // One prompt was shown, consuming pairObjects entries from the shared pool.
+  const pool=config.questions.filter(q=>q.enabled!==false).length;
+  assert.equal(state.shared.remaining.length,pool-config.pairObjects);
+  assert.equal(state.shared.recent.length,config.pairObjects);
 });
 const labelMap=()=>{
   const names=Object.fromEntries(html.match(/const names = `([^`]+)`/)[1].split('|').map(x=>x.split('=')));
@@ -206,79 +232,80 @@ function drawObject(a,slot,lines){
     a.pointer('pointerdown',x,80+i*30);a.pointer('pointermove',x+120,110+i*30);a.pointer('pointermove',x+240,80+i*30);a.pointer('pointerup');
   }
 }
-const strokesFor=level=>level==='hard'?config.pairMinimumStrokes:config.easyMinimumStrokes;
+// Both levels draw the same task, so one helper covers them.
+function drawPair(a,keys){
+  const half=Math.ceil(config.pairMinimumStrokes/2);
+  drawObject(a,'left',half);drawObject(a,'right',half);
+  // Clusters are classified left to right, so answer in that order.
+  a.queuePredictions(keys,1);
+}
 test('actual scoring controller grants 1 easy stamp and 2 hard stamps',async()=>{
   for(const [level,expected] of [['easy','1'],['hard','2']]){
     const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
     for(let round=0;round<2;round++){
       const keys=promptKeys(a);for(const key of keys)assert.ok(key);
       assert.equal(keys.length,config.pairObjects);
-      const need=strokesFor(level);
-      if(level==='hard'){
-        drawObject(a,'left',Math.ceil(need/2));drawObject(a,'right',Math.ceil(need/2));
-        // Clusters are classified left to right, so answer in that order.
-        a.queuePredictions(keys,1);
-      }else{
-        // Easy needs only one of the two named objects.
-        drawObject(a,'left',2);
-        a.setPrediction(keys[0],1);
-      }
+      drawPair(a,keys);
       a.advance(500);await a.flush();assert.equal(a.nodes.get('roundMessage').textContent,'我猜到了！',level);a.advance(1100);
     }
     assert.equal(a.nodes.get('earnedCount').textContent,expected);assert.equal(a.nodes.get('resultScreen').hidden,false);
   }
 });
-test('both levels name two objects and differ only in how many are required',async()=>{
+test('both levels draw two objects and both must be recognised',async()=>{
   for(const level of ['easy','hard']){
     const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
-    assert.equal(promptKeys(a).length,2,level);
-    assert.match(a.nodes.get('targetName').textContent,/和/,level);
-  }
-});
-test('easy passes on one object while hard still needs the second',async()=>{
-  // Same drawing, same prediction: easy scores, hard does not.
-  for(const [level,shouldWin] of [['easy',true],['hard',false]]){
-    const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
     const keys=promptKeys(a);
-    const need=Math.max(2,strokesFor(level));
-    drawObject(a,'left',Math.ceil(need/2));drawObject(a,'right',Math.ceil(need/2));
+    assert.equal(keys.length,2,level);
+    assert.match(a.nodes.get('targetName').textContent,/和/,level);
+    // Recognising only the first object must never finish the round, on either level.
+    const half=Math.ceil(config.pairMinimumStrokes/2);
+    drawObject(a,'left',half);drawObject(a,'right',half);
     a.queuePredictions([keys[0],'sun'],1);
     a.advance(500);await a.flush();
-    const won=!a.nodes.get('roundOverlay').hidden&&a.nodes.get('roundMessage').textContent==='我猜到了！';
-    assert.equal(won,shouldWin,level);
-    if(!shouldWin){
-      assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/);
-      a.advance(23000);
-      assert.equal(a.nodes.get('roundMessage').textContent,'这次还差一点');
-      assert.match(a.nodes.get('roundDetail').textContent,/还差 1 个/);
-    }
+    assert.equal(a.nodes.get('roundOverlay').hidden,true,level);
+    assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/,level);
+    a.advance(23000);
+    assert.equal(a.nodes.get('roundMessage').textContent,'这次还差一点',level);
+    assert.match(a.nodes.get('roundDetail').textContent,/还差 1 个/,level);
   }
 });
-test('one shape drawn in a single place cannot satisfy both hard objects',async()=>{
-  const a=await app();a.click('hardButton');a.click('startButton');
-  const keys=promptKeys(a);
-  // All ink in one slot forms a single cluster, so a correct label can only ever match once.
-  drawObject(a,'left',config.pairMinimumStrokes);
-  a.queuePredictions([keys[0],keys[1]],1);
-  a.advance(500);await a.flush();
-  assert.equal(a.nodes.get('roundOverlay').hidden,true);
-  assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/);
+test('the levels differ only in how many prompts must pass',async()=>{
+  // One prompt passed, one timed out: easy earns a stamp, hard earns nothing.
+  for(const [level,expected] of [['easy','1'],['hard','0']]){
+    const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
+    drawPair(a,promptKeys(a));
+    a.advance(500);await a.flush();
+    assert.equal(a.nodes.get('roundMessage').textContent,'我猜到了！',level);
+    a.advance(1100);
+    a.advance(23000);a.advance(1100);
+    assert.equal(a.nodes.get('earnedCount').textContent,expected,level);
+  }
+  assert.deepEqual(config.objectsNeeded,{easy:2,hard:2});
+  assert.equal(config.pairObjects,2);
 });
-test('easy uses the strict single-object bars, hard the relaxed paired bars',()=>{
+test('one shape drawn in a single place cannot satisfy both objects',async()=>{
+  for(const level of ['easy','hard']){
+    const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
+    const keys=promptKeys(a);
+    // All ink in one slot forms a single cluster, so a correct label can only ever match once.
+    drawObject(a,'left',config.pairMinimumStrokes);
+    a.queuePredictions([keys[0],keys[1]],1);
+    a.advance(500);await a.flush();
+    assert.equal(a.nodes.get('roundOverlay').hidden,true,level);
+    assert.match(a.nodes.get('guessNote').textContent,/已认出 1 \/ 2/,level);
+  }
+});
+test('both levels judge every object by the same calibrated bar',()=>{
   const answerConfig=embedded('embeddedAnswerRules');
   const policy=Answers.create(classes,answerConfig);
-  for(const key of ['angel','strawberry','barn']){
-    const strict=policy.thresholdFor(key),relaxed=policy.pairThresholdFor(key);
-    assert.ok(relaxed<=strict,key);
-    // Only the hard level relaxes the bar, so a confidence between the two must split the levels.
-    if(relaxed<strict){
-      const between=(relaxed+strict)/2;
-      assert.equal(policy.assess(key,{key,confidence:between},true).accepted,true,key);
-      assert.equal(policy.assess(key,{key,confidence:between},false).accepted,false,key);
-    }
+  const enabled=config.questions.filter(q=>q.enabled!==false);
+  // One shared pool and one shared bar table: the level must not change the drawing task.
+  for(const q of enabled){
+    const bar=policy.pairThresholdFor(q.key);
+    assert.equal(answerConfig.pairConfidence[q.key],bar,q.key);
+    assert.ok(bar>answerConfig.minimumConfidence,q.key);
   }
-  assert.deepEqual(config.objectsNeeded,{easy:1,hard:2});
-  assert.equal(config.pairObjects,2);
+  assert.deepEqual(config.objectsNeeded,{easy:2,hard:2});
 });
 test('formal rounds hide the runner-up guesses, practice still shows them',async()=>{
   const a=await app();a.click('startButton');a.setPrediction(promptKeys(a)[0],.3);
@@ -293,23 +320,25 @@ test('formal rounds hide the runner-up guesses, practice still shows them',async
 
 test('a loose match that used to win now times out instead of scoring',async()=>{
   const a=await app();a.click('startButton');
-  const key=promptKeys(a)[0];
-  // The correct class at the former 22% bar must no longer finish the round.
-  a.setPrediction(key,.25);
-  drawObject(a,'left',2);
+  const keys=promptKeys(a);
+  // Both correct classes at the former 22% bar must no longer finish the round.
+  const half=Math.ceil(config.pairMinimumStrokes/2);
+  drawObject(a,'left',half);drawObject(a,'right',half);
+  a.queuePredictions(keys,.25);
   a.advance(500);await a.flush();
   assert.equal(a.nodes.get('roundOverlay').hidden,true);
-  assert.match(a.nodes.get('guessText').textContent,/我猜/);
+  // Neither object was accepted, so no progress is recorded.
+  assert.match(a.nodes.get('guessNote').textContent,/已认出 0 \/ 2/);
   a.advance(23000);assert.equal(a.nodes.get('roundMessage').textContent,'这次还差一点');
 });
 
-test('hard mode draws the fifty reviewed prompts and excludes quick outline examples', () => {
-  const expected=["cow","horse","angel","flamingo","campfire","house_plant","harp","guitar","penguin","bridge","bus","crab","school_bus","train","dresser","tractor","bee","lighthouse","chandelier","bicycle","sink","stereo","owl","giraffe","elephant","parachute","kangaroo","tennis_racquet","lion","syringe","stove","scorpion","sea_turtle","bulldozer","cannon","zebra","windmill","speedboat","fireplace","barn","helicopter","mermaid","squirrel","monkey","ambulance","parrot","hedgehog","calendar","passport","church"].sort();
-  const actual=config.questions.filter(q=>q.enabled&&q.level==='hard').map(q=>q.key).sort();
-  assert.deepEqual(actual,expected);
-  assert.equal(config.hardMinimumStrokes,5);
-  for(const key of ['palm_tree','aircraft_carrier','calculator','piano','camera','cactus','megaphone','octagon'])assert.ok(!actual.includes(key));
-  for(const key of actual){const q=config.questions.find(q=>q.key===key);assert.equal(q.expandedScreen.sampleCount,32);assert.ok(q.expandedScreen.medianTotalStrokes>=5);}
+test('the shared pool only holds objects screened on a two-object canvas', () => {
+  const enabled=config.questions.filter(q=>q.enabled!==false);
+  assert.equal(config.pairMinimumStrokes,8);
+  for(const q of enabled)assert.equal(q.calibration,'pair-screened',q.key);
+  // Objects that the model cannot pick out of a shared canvas stay out of the pool.
+  for(const key of ['square','circle','line','spoon','triangle','zigzag','moon','cloud','knife'])
+    assert.ok(!enabled.some(q=>q.key===key),key);
 });
 
 test('ink readiness counts completed lines and ignores taps and short marks', () => {
@@ -344,13 +373,20 @@ test('dots cannot open hard analysis, and undo/clear reduce the required ink pro
   const after=a.predictionCalls();a.advance(500);await a.flush();assert.equal(a.predictionCalls(),after);
   a.click('clearButton');assert.match(a.nodes.get('guessNote').textContent,new RegExp('0 / '+need));
 });
-test('easy and free practice still infer from the first stroke, including practice after selecting hard',async()=>{
-  // Easy names two objects but needs only one, and many easy objects are drawn in one or two
-  // strokes, so easy must keep guessing from the first stroke.
-  assert.equal(config.easyMinimumStrokes,0);
-  for(const mode of ['easy','practice']){
-    const a=await app();if(mode==='practice')a.click('hardButton');a.click(mode==='practice'?'practiceButton':'startButton');
+test('free practice still infers from the first stroke, whichever level was selected',async()=>{
+  for(const level of ['easy','hard']){
+    const a=await app();if(level==='hard')a.click('hardButton');a.click('practiceButton');
     const before=a.predictionCalls();inkLine(a,0);a.advance(500);await a.flush();
-    assert.ok(a.predictionCalls()>before,mode);
+    assert.ok(a.predictionCalls()>before,level);
+  }
+});
+test('both levels wait for the same stroke gate before guessing',async()=>{
+  const need=config.pairMinimumStrokes;
+  for(const level of ['easy','hard']){
+    const a=await app();if(level==='hard')a.click('hardButton');a.click('startButton');
+    const before=a.predictionCalls();
+    for(let i=0;i<need-1;i++){inkLine(a,i);a.advance(500);await a.flush();assert.equal(a.predictionCalls(),before,level);}
+    assert.match(a.nodes.get('guessNote').textContent,new RegExp((need-1)+' / '+need),level);
+    inkLine(a,need-1);a.advance(500);await a.flush();assert.ok(a.predictionCalls()>before,level);
   }
 });
