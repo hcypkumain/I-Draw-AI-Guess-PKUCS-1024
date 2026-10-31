@@ -66,18 +66,19 @@ test('prompt bars below the floor or above one are rejected', () => {
   const unknown = {...answerConfig, promptConfidence: {...answerConfig.promptConfidence, not_a_class: .9}};
   assert.throws(() => Answers.create(classes, unknown), /Unknown answer class/);
 });
-test('both levels share one screened pool of 88 objects', () => {
+test('both levels share one screened pool of 211 objects', () => {
   const deck = Questions.create(classes, config);
   assert.equal(config.questions.length,345);
   const enabled = config.questions.filter(q=>q.enabled!==false);
-  assert.equal(enabled.length,88);
+  assert.equal(enabled.length,211);
   // The shared pool means both levels report the same bank.
-  assert.equal(deck.count('easy'),88);
-  assert.equal(deck.count('hard'),88);
-  assert.equal(deck.pausedCount(),345-88);
+  assert.equal(deck.count('easy'),211);
+  assert.equal(deck.count('hard'),211);
+  assert.equal(deck.pausedCount(),345-211);
   assert.equal(config.sharedPool,true);
-  for(const key of ['ant','crocodile','spider','lobster','keyboard','dragon','animal_migration','camouflage','The_Mona_Lisa','aircraft_carrier'])assert.equal(config.questions.find(q=>q.key===key).enabled,false);
+  // Membership now comes from the two-object screening, not the old per-level lists.
   for(const q of config.questions.filter(q=>!q.enabled))assert.ok(q.reviewReason,q.key);
+  for(const q of enabled)assert.ok(q.pinyin,q.key);
 });
 test('the shared deck serves the same objects to either level', () => {
   const storage=store();
@@ -337,8 +338,10 @@ test('the shared pool only holds objects screened on a two-object canvas', () =>
   assert.equal(config.pairMinimumStrokes,8);
   for(const q of enabled)assert.equal(q.calibration,'pair-screened',q.key);
   // Objects that the model cannot pick out of a shared canvas stay out of the pool.
-  for(const key of ['square','circle','line','spoon','triangle','zigzag','moon','cloud','knife'])
+  for(const key of ['square','circle','line','spoon','triangle','zigzag','moon','knife'])
     assert.ok(!enabled.some(q=>q.key===key),key);
+  // The pool must stay large enough that prompts do not repeat quickly on site.
+  assert.ok(enabled.length>=150,'pool should hold at least 150 objects, got '+enabled.length);
 });
 
 test('ink readiness counts completed lines and ignores taps and short marks', () => {
